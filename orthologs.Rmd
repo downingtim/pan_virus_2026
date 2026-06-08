@@ -7,7 +7,6 @@ title: "pig-human-cow"
 ```{r}
 library(biomaRt)
 library(dplyr)
-library(HGNChelper)
 library(readxl)
 
 # ── Marts ──────────────────────────────────────────────────────────────────────
@@ -94,8 +93,6 @@ cow_pig_human_complete <- pig_human_orthologs %>%
     cow_homolog_confidence
   )
 
-str(cow_pig_human_complete)
-
 # ── Species-pair 1-to-1 filters ────────────────────────────────────────────────
 orthologs_1to1_ph <- pig_human_complete %>%
   filter(hsapiens_homolog_orthology_type       == "ortholog_one2one",
@@ -113,20 +110,12 @@ orthologs_1to1_chp <- cow_pig_human_complete %>%
     cow_homolog_type                          == "ortholog_one2one",
     cow_homolog_confidence                    == 1,
     !is.na(cow_ensembl_gene_id)
-  )
-
-# drop redundant confidence/type columns from three-way table
-orthologs_1to1_chp <- orthologs_1to1_chp %>%
-  select(-pig_hsapiens_homolog_orthology_confidence,
-         -cow_homolog_confidence,
+  ) %>%
+  select(-pig_hsapiens_homolog_orthology_type,
+         -pig_hsapiens_homolog_orthology_confidence,
          -cow_homolog_type,
-         -pig_hsapiens_homolog_orthology_type)
+         -cow_homolog_confidence)
 
-str(orthologs_1to1_ph)   # pig-human
-str(orthologs_1to1_ch)   # cow-human
-str(orthologs_1to1_chp)  # three-way
-
-# ── Save species-pair and three-way tables ─────────────────────────────────────
 write.csv(orthologs_1to1_ph,      "pig_human_orthologs_1to1.csv",     row.names = FALSE)
 write.csv(orthologs_1to1_ch,      "cow_human_orthologs_1to1.csv",     row.names = FALSE)
 write.csv(orthologs_1to1_chp,     "pig_cow_human_orthologs_1to1.csv", row.names = FALSE)
@@ -136,31 +125,56 @@ setwd("~/Desktop/Pan_virus_AI_Surrey_2026/")
 df <- read_excel("pan_virus_surrey.xlsx")
 dim(df)
 
-# ── Initial merge: strict three-way 1to1 only ─────────────────────────────────
+# ── Initial merge: strict three-way 1to1 ──────────────────────────────────────
 merged_df <- merge(orthologs_1to1_chp, df,
                    by.x = "hsapiens_homolog_associated_gene_name",
                    by.y = "Gene")
 dim(merged_df)  # 3232 / 3934
 
 # ── Identify unmatched genes ───────────────────────────────────────────────────
-unmatched_genes <- df$Gene[!df$Gene %in% orthologs_1to1_chp$hsapiens_homolog_associated_gene_name]
-cat(length(unmatched_genes), "unmatched genes\n")  # 728
+unmatched_genes <- df$Gene[
+  !df$Gene %in% orthologs_1to1_chp$hsapiens_homolog_associated_gene_name
+]
+cat(length(unmatched_genes), "unmatched genes\n")  # 702
 
-# ── Diagnose unmatched ─────────────────────────────────────────────────────────
-unmatched_in_full <- pig_human_orthologs %>%
-  filter(hsapiens_homolog_associated_gene_name %in% unmatched_genes) %>%
-  select(hsapiens_homolog_associated_gene_name, hsapiens_homolog_orthology_type) %>%
-  distinct()
-table(unmatched_in_full$hsapiens_homolog_orthology_type)
-# ortholog_many2many ortholog_one2many ortholog_one2one
-#                  1               120              534
+# ── Helper: cow best-available lookup (shared across rescues) ─────────────────
+cow_best <- cow_human_orthologs %>%
+  filter(hsapiens_homolog_ensembl_gene != "") %>%
+  group_by(hsapiens_homolog_ensembl_gene) %>%
+  slice_max(hsapiens_homolog_orthology_confidence, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    hsapiens_homolog_ensembl_gene,
+    cow_ensembl_gene_id = ensembl_gene_id,
+    cow_gene_name       = external_gene_name
+  )
+
+# ── Helper: aligns any tier to canonical columns, adding NAs if missing ───────
+canonical_cols <- c(
+  "hsapiens_homolog_associated_gene_name",
+  "pig_ensembl_gene_id",
+  "pig_gene_name",
+  "pig_entrezgene_id",
+  "hsapiens_homolog_ensembl_gene",
+  "human_entrezgene_id",
+  "cow_ensembl_gene_id",
+  "cow_gene_name",
+  "cow_entrezgene_id",
+  "ortholog_rescue"
+)
+
+align_to_canonical <- function(df) {
+  for (col in canonical_cols) {
+    if (!col %in% names(df)) df[[col]] <- NA
+  }
+  df %>% select(all_of(canonical_cols))
+}
 
 # ── Rescue 1: pig-human 1to1, cow optional ────────────────────────────────────
-# 534 one2one genes dropped only because no cow 1to1 counterpart
 rescue_1to1_nocow <- pig_human_orthologs %>%
   filter(
     hsapiens_homolog_associated_gene_name %in% unmatched_genes,
-    hsapiens_homolog_orthology_type == "ortholog_one2one",
+    hsapiens_homolog_orthology_type       == "ortholog_one2one",
     hsapiens_homolog_orthology_confidence == 1
   ) %>%
   left_join(pig_entrez, by = "ensembl_gene_id") %>%
@@ -176,19 +190,7 @@ rescue_1to1_nocow <- pig_human_orthologs %>%
     ),
     by = "hsapiens_homolog_ensembl_gene"
   ) %>%
-  left_join(
-    cow_human_orthologs %>%
-      filter(hsapiens_homolog_ensembl_gene != "") %>%
-      group_by(hsapiens_homolog_ensembl_gene) %>%
-      slice_max(hsapiens_homolog_orthology_confidence, n = 1, with_ties = FALSE) %>%
-      ungroup() %>%
-      select(
-        hsapiens_homolog_ensembl_gene,
-        cow_ensembl_gene_id = ensembl_gene_id,
-        cow_gene_name       = external_gene_name
-      ),
-    by = "hsapiens_homolog_ensembl_gene"
-  ) %>%
+  left_join(cow_best, by = "hsapiens_homolog_ensembl_gene") %>%
   left_join(
     cow_entrez %>% rename(
       cow_ensembl_gene_id = ensembl_gene_id,
@@ -226,19 +228,7 @@ rescue_one2many <- pig_human_orthologs %>%
     ),
     by = "hsapiens_homolog_ensembl_gene"
   ) %>%
-  left_join(
-    cow_human_orthologs %>%
-      filter(hsapiens_homolog_ensembl_gene != "") %>%
-      group_by(hsapiens_homolog_ensembl_gene) %>%
-      slice_max(hsapiens_homolog_orthology_confidence, n = 1, with_ties = FALSE) %>%
-      ungroup() %>%
-      select(
-        hsapiens_homolog_ensembl_gene,
-        cow_ensembl_gene_id = ensembl_gene_id,
-        cow_gene_name       = external_gene_name
-      ),
-    by = "hsapiens_homolog_ensembl_gene"
-  ) %>%
+  left_join(cow_best, by = "hsapiens_homolog_ensembl_gene") %>%
   left_join(
     cow_entrez %>% rename(
       cow_ensembl_gene_id = ensembl_gene_id,
@@ -251,15 +241,13 @@ rescue_one2many <- pig_human_orthologs %>%
 still_after_r2 <- still_after_r1[
   !still_after_r1 %in% rescue_one2many$hsapiens_homolog_associated_gene_name
 ]
-cat(length(still_after_r2), "still unmatched after rescue 2\n")  # 164 left
+cat(length(still_after_r2), "still unmatched after rescue 2\n")
 
-# ── Rescue 3: confirmed 1to1 with no cow ortholog at all ──────────────────────
-# These are in BioMart as 1to1 but were missed by rescue 1 due to row
-# duplication issues from the Entrez join; pull directly from raw table
+# ── Rescue 3: confirmed 1to1 with no cow ortholog ─────────────────────────────
 confirmed_1to1_nocow <- pig_human_orthologs %>%
   filter(
     hsapiens_homolog_associated_gene_name %in% still_after_r2,
-    hsapiens_homolog_orthology_type == "ortholog_one2one",
+    hsapiens_homolog_orthology_type       == "ortholog_one2one",
     hsapiens_homolog_orthology_confidence == 1
   ) %>%
   left_join(pig_entrez, by = "ensembl_gene_id") %>%
@@ -275,19 +263,7 @@ confirmed_1to1_nocow <- pig_human_orthologs %>%
     ),
     by = "hsapiens_homolog_ensembl_gene"
   ) %>%
-  left_join(
-    cow_human_orthologs %>%
-      filter(hsapiens_homolog_ensembl_gene != "") %>%
-      group_by(hsapiens_homolog_ensembl_gene) %>%
-      slice_max(hsapiens_homolog_orthology_confidence, n = 1, with_ties = FALSE) %>%
-      ungroup() %>%
-      select(
-        hsapiens_homolog_ensembl_gene,
-        cow_ensembl_gene_id = ensembl_gene_id,
-        cow_gene_name       = external_gene_name
-      ),
-    by = "hsapiens_homolog_ensembl_gene"
-  ) %>%
+  left_join(cow_best, by = "hsapiens_homolog_ensembl_gene") %>%
   left_join(
     cow_entrez %>% rename(
       cow_ensembl_gene_id = ensembl_gene_id,
@@ -301,35 +277,32 @@ still_after_r3 <- still_after_r2[
   !still_after_r2 %in% confirmed_1to1_nocow$hsapiens_homolog_associated_gene_name
 ]
 cat(length(still_after_r3), "genuinely unresolvable\n")
-still_after_r3  # NaN, F, HE, H1-2, NABP1;NABP2 etc — malformed/ambiguous symbols
+still_after_r3
 
 # ── Final assembly ─────────────────────────────────────────────────────────────
 orthologs_rescue_all <- bind_rows(
-  orthologs_1to1_chp %>% mutate(ortholog_rescue = "1to1_all_three"),
-  rescue_1to1_nocow,
-  rescue_one2many,
-  confirmed_1to1_nocow
+  orthologs_1to1_chp %>%
+    mutate(ortholog_rescue = "1to1_all_three") %>%
+    align_to_canonical(),
+  align_to_canonical(rescue_1to1_nocow),
+  align_to_canonical(rescue_one2many),
+  align_to_canonical(confirmed_1to1_nocow)
 )
 
+# ── Merge with experimental data ───────────────────────────────────────────────
 merged_df_complete <- df %>%
   left_join(orthologs_rescue_all,
             by = c("Gene" = "hsapiens_homolog_associated_gene_name"))
 
-# ── Summary ────────────────────────────────────────────────────────────────────
-View(table(merged_df_complete$ortholog_rescue, useNA = "always"))
-# Expected roughly:
-# 1to1_all_three               3232
-# 1to1_pig_human_cow_optional  454  (rescue 1)
-# one2many_best                128  (rescue 2)
-# 1to1_pig_human_no_cow        91  (rescue 3)
-# <NA>                         73  (genuinely unresolvable)
-View(merged_df_complete)
-colnames(merged_df_complete)
+# ── Coverage summary ───────────────────────────────────────────────────────────
+table(merged_df_complete$ortholog_rescue, useNA = "always")
+cat("pig ID coverage:   ", sum(!is.na(merged_df_complete$pig_ensembl_gene_id)), "/", nrow(df), "\n")
+cat("human ID coverage: ", sum(!is.na(merged_df_complete$hsapiens_homolog_ensembl_gene)), "/", nrow(df), "\n")
+cat("cow ID coverage:   ", sum(!is.na(merged_df_complete$cow_ensembl_gene_id)), "/", nrow(df), "\n")
 
-merged_df_complete <- merged_df_complete |>
-  select(-ortholog_rescue, -hsapiens_homolog_orthology_type,
-         -ortholog_rescue,  -hsapiens_homolog_orthology_confidence) 
-head(merged_df_complete)
-write.csv(merged_df_complete, "merged_orthologs_pig_human_cow.csv",
-          row.names = FALSE)
+# ── Drop uninformative columns and save ───────────────────────────────────────
+merged_df_complete <- merged_df_complete %>%
+  select(-ortholog_rescue)
+
+write.csv(merged_df_complete, "merged_orthologs_panvirus_complete.csv", row.names = FALSE)
 ```
