@@ -1,0 +1,405 @@
+---
+title: "pan_virus" 
+---
+
+
+
+```{r}
+setwd("~/Desktop/Pan_virus_AI_Surrey_2026/")
+
+library(readxl)
+#BiocManager::install("limma")
+library(limma)
+library(ggplot2)
+library(matrixStats)
+library(stringr) 
+library(reshape2)
+
+# ===============================
+# 2. Load data
+# ===============================
+df <- read_excel("pan_virus_surrey.xlsx")
+gene_names <- df[[1]]   # first column explicitly
+df <- df[, -1] # Remove gene column
+# Convert to numeric safely
+df[] <- lapply(df, function(x) as.numeric(as.character(x)))
+E <- as.matrix(df) # Convert to matrix
+# reattach gene names correctly
+rownames(E) <- gene_names
+mode(E) <- "numeric"
+
+# 3. Remove unwanted columns
+#remove_cols <- c( "A549_Mock_33C_1", "A549_Mock_33C_2", "A549_Mock_33C_3")
+remove_cols <- c(  )
+keep_cols <- !(colnames(E) %in% remove_cols)
+E <- E[, keep_cols]
+
+# ===============================
+# 4. Build metadata AFTER filtering
+# ===============================
+samples <- colnames(E)
+
+host <- ifelse(grepl("^A549", samples), "human",
+         ifelse(grepl("^PK-15", samples), "pig",
+         ifelse(grepl("^MDBK", samples), "cow", NA)))
+
+virus <- str_split(samples, "_", simplify=TRUE)[,2]
+virus[virus == "Mock"] <- "mock"
+
+targets <- data.frame(
+  sample = samples,
+  host   = factor(host),
+  virus  = factor(virus)
+)
+
+# ✅ ABSOLUTE GUARANTEE of alignment
+stopifnot(all(targets$sample == colnames(E)))
+
+# ===============================
+# 5. Handle missing values
+# ===============================
+E[is.nan(E)] <- NA
+
+# ===============================
+# 6. Log transform (if needed)
+# ===============================
+if(max(E, na.rm=TRUE) > 50) {
+  E <- log2(E + 1)
+}
+
+# ===============================
+# 7. Quantile normalisation
+# ===============================
+E_norm <- normalizeBetweenArrays(E, method = "quantile")
+
+# ===============================
+# 8. QC plots (ggplot2, faceted)
+# ===============================
+
+plot_box <- function(mat, title) {
+  
+  df_long <- melt(mat)
+  colnames(df_long) <- c("Protein","Sample","Expression")
+  
+  df_long <- merge(df_long, targets,
+                   by.x="Sample", by.y="sample",
+                   all.x=TRUE, sort=FALSE)
+  
+  ggplot(df_long, aes(x = Sample, y = Expression, fill = host)) +
+    geom_boxplot(outlier.size=0.2) +
+    facet_wrap(~virus, scales="free_x") +
+    theme_minimal(base_size=11) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      strip.text = element_text(size=8)
+    ) +
+    labs(title=title)
+}
+
+pdf("QC_before.pdf", width=14, height=8)
+print(plot_box(E, "Before normalisation"))
+dev.off()
+pdf("QC_after.pdf", width=14, height=8)
+print(plot_box(E_norm, "After quantile normalisation"))
+dev.off()
+
+# ===============================
+# 9. PCA preparation
+# ===============================
+
+# Filter proteins (too many NAs)
+keep <- rowSums(is.na(E_norm)) < (0.5 * ncol(E_norm))
+E_pca <- E_norm[keep, ]
+
+# Row-mean imputation (PCA only)
+row_means <- rowMeans(E_pca, na.rm=TRUE)
+for(i in 1:nrow(E_pca)){
+  E_pca[i, is.na(E_pca[i,])] <- row_means[i]
+}
+
+# PCA
+pca_result <- prcomp(t(E_pca), scale.=TRUE)
+
+# Build PCA dataframe
+pca_df <- as.data.frame(pca_result$x)
+pca_df$sample <- rownames(pca_df)
+
+# Merge metadata safely
+pca_df <- merge(pca_df, targets, by="sample", sort=FALSE)
+
+# ===============================
+# 10. Variance explained plots
+# ===============================
+var_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+cumvar <- cumsum(var_explained)
+
+pdf("PCA_variance.pdf", width=10, height=6)
+barplot(var_explained[1:10]*100,
+        names.arg=paste0("PC",1:10),
+        col="#0072B2",
+        main="Variance per PC",
+        ylab="% variance explained",
+        las=2)
+dev.off()
+plot(cumvar[1:20]*100,
+     type="b", pch=16,
+     col="#D55E00",
+     main="Cumulative variance",
+     xlab="# PCs",
+     ylab="Cumulative %",
+     ylim=c(0,100))
+abline(h=80, lty=2, col="grey50")
+
+# dev.off()
+
+cat("PC1:", round(var_explained[1]*100,1), "%\n")
+cat("PC2:", round(var_explained[2]*100,1), "%\n")
+cat("PC1+PC2:", round(sum(var_explained[1:2])*100,1), "%\n")
+
+# ===============================
+# 11. PCA plots (INDIVIDUAL, no function)
+# ===============================
+pdf("PC1_PC2.pdf", width=8, height=7)
+ggplot(pca_df, aes(PC1, PC2, colour=host, shape=virus)) +
+  geom_point(size=3, alpha=0.9) +
+  scale_shape_manual(values = 1:length(unique(pca_df$virus))) +
+  stat_ellipse(aes(group=host), level=0.95) +
+  theme_minimal(base_size=13) +
+  labs(
+    title="PCA: PC1 vs PC2",
+    x=paste0("PC1 (", round(var_explained[1]*100,1),"%)"),
+    y=paste0("PC2 (", round(var_explained[2]*100,1),"%)")
+  ) -> p1
+print(p1)
+dev.off()
+# PC3 vs PC4
+pdf("PC3_PC3.pdf", width=8, height=7)
+ggplot(pca_df, aes(PC3, PC4, colour=host, shape=virus)) +
+  geom_point(size=3, alpha=0.9) +
+  scale_shape_manual(values = 1:length(unique(pca_df$virus))) +
+  stat_ellipse(aes(group=host), level=0.95) +
+  theme_minimal(base_size=13) +
+  labs(
+    title="PCA: PC3 vs PC4",
+    x=paste0("PC3 (", round(var_explained[3]*100,1),"%)"),
+    y=paste0("PC4 (", round(var_explained[4]*100,1),"%)")
+  ) -> p2
+print(p2)
+dev.off()
+# PC5 vs PC6
+pdf("PC5_PC6.pdf", width=8, height=7)
+ggplot(pca_df, aes(PC5, PC6, colour=host, shape=virus)) +
+  geom_point(size=3, alpha=0.9) +
+  scale_shape_manual(values = 1:length(unique(pca_df$virus))) +
+  stat_ellipse(aes(group=host), level=0.95) +
+  theme_minimal(base_size=13) +
+  labs(    x=paste0("PC5 (", round(var_explained[5]*100,1),"%)"),
+    y=paste0("PC6 (", round(var_explained[6]*100,1),"%)")) -> p3
+print(p3)
+dev.off()
+
+#  library(uwot)        # UMAP
+
+X <- t(E_norm)
+for (j in 1:ncol(X)) {
+  X[is.na(X[, j]), j] <- mean(X[, j], na.rm = TRUE)}
+meta <- targets[match(rownames(X), targets$sample), ]
+cols <- c("human"="red", "pig"="blue", "cow"="darkgreen")
+n <- nrow(X)
+neighbor_values <- c(2, 4, 6, 8)
+neighbor_values <- neighbor_values[neighbor_values >= 2 & neighbor_values < n]
+if (length(neighbor_values) == 0) { neighbor_values <- max(2, n - 1)}
+
+# Run UMAP
+pdf("UMAP_plots.pdf", width=10, height=8)
+par(mfrow = c(2, 2))
+for (nn in neighbor_values) {
+  set.seed(42)
+  umap_result <- umap(  X,   n_neighbors = nn,
+    min_dist = 0.1,  n_components = 2,  verbose = F  )
+  coords <- umap_result
+  plot(  coords[,1],  coords[,2], col = cols[meta$host],
+    pch = 16, main = paste("n_neighbors =", nn),
+    xlab = "UMAP 1",   ylab = "UMAP 2",  cex = 0.9 )
+  legend("topright", legend = names(cols),
+         col = cols,pch = 16,  cex = 0.8)}
+dev.off()
+
+par(mfrow = c(1,1))
+
+# ===============================
+# do pca for human only
+E_human <- E_norm[, targets$host == "human"]
+targets_human <- targets[targets$host == "human", ]
+# Filter proteins (too many NAs)
+keep_human <- rowSums(is.na(E_human)) < (0.5 * ncol(E_human))
+E_human_pca <- E_human[keep_human, ]
+# Row-mean imputation (PCA only)
+row_means_human <- rowMeans(E_human_pca, na.rm=T)
+for(i in 1:nrow(E_human_pca)){
+  E_human_pca[i, is.na(E_human_pca[i,])] <- row_means_human[i] }
+vars <- apply(E_human_pca, 1, var, na.rm=T)
+E_human_pca <- E_human_pca[vars > 0, ]
+pca_human <- prcomp(t(E_human_pca), scale.=T, center=T)
+var_explained_h <- pca_human$sdev^2 / sum(pca_human$sdev^2)
+pca_human_df <- as.data.frame(pca_human$x)
+pca_human_df$sample <- rownames(pca_human_df)
+pca_human_df <- merge(pca_human_df, targets_human,
+                      by.x="sample", by.y="sample", sort=FALSE)
+pdf("PCA_human_1_2.pdf", width=8, height=7)
+h12 <- ggplot(pca_human_df, aes(PC1, PC2, colour=virus)) +
+  geom_point(size=4, alpha=0.5) +
+  scale_shape_manual(values = 1:length(unique(pca_human_df$virus))) +
+  theme_minimal(base_size=13) +
+  labs(  title="Human",
+    x=paste0("PC1 (", round(var_explained_h[1]*100,1),"%)"),
+    y=paste0("PC2 (", round(var_explained_h[2]*100,1),"%)") ) +
+  ggrepel::geom_text_repel(aes(label=gsub("A549_","",sample)), 
+                           size=4, max.overlaps=990) 
+dev.off()
+
+pdf("PCA_human_3_4.pdf", width=8, height=7)
+h34 <- ggplot(pca_human_df, aes(PC3, PC4, colour=virus)) +
+  geom_point(size=4, alpha=0.5) +
+  scale_shape_manual(values = 1:length(unique(pca_human_df$virus))) +
+  theme_minimal(base_size=13) +
+  labs(  title="Human",
+    x=paste0("PC3 (", round(var_explained_h[3]*100,1),"%)"),
+    y=paste0("PC4 (", round(var_explained_h[4]*100,1),"%)") ) +
+  ggrepel::geom_text_repel(aes(label=gsub("A549_","",sample)), 
+                           size=4, max.overlaps=990)
+dev.off()
+
+## pig
+
+E_pig <- E_norm[, targets$host == "pig"]
+targets_pig <- targets[targets$host == "pig", ]
+keep_pig <- rowSums(is.na(E_pig)) < (0.5 * ncol(E_pig))
+E_pig_pca <- E_pig[keep_pig, ]
+
+row_means_pig <- rowMeans(E_pig_pca, na.rm=TRUE)
+for(i in 1:nrow(E_pig_pca)){
+  E_pig_pca[i, is.na(E_pig_pca[i,])] <- row_means_pig[i]
+}
+
+vars <- apply(E_pig_pca, 1, var, na.rm=TRUE)
+E_pig_pca <- E_pig_pca[vars > 0, ]
+
+pca_pig <- prcomp(t(E_pig_pca), scale.=TRUE, center=TRUE)
+var_explained_pig <- pca_pig$sdev^2 / sum(pca_pig$sdev^2)
+
+pca_pig_df <- as.data.frame(pca_pig$x)
+pca_pig_df$sample <- rownames(pca_pig_df)
+pca_pig_df <- merge(pca_pig_df, targets_pig, by="sample", sort=FALSE)
+
+pdf("PCA_pig_1_2.pdf", width=8, height=7)
+p12 <- ggplot(pca_pig_df, aes(PC1, PC2, colour=virus, shape=virus)) +
+  geom_point(size=4, alpha=0.6) +
+  scale_shape_manual(values=1:length(unique(pca_pig_df$virus))) +
+  theme_minimal(base_size=13) +
+  labs( title="Pig",x=paste0("PC1 (",round(var_explained_pig[1]*100,1),"%)"),
+    y=paste0("PC2 (", round(var_explained_pig[2]*100,1),"%)")) +
+  ggrepel::geom_text_repel(  aes(label=gsub("PK-15_","",sample)),
+    size=4, max.overlaps=999  )
+dev.off() 
+
+pdf("PCA_pig_3_4.pdf", width=8, height=7)
+p34 <- ggplot(pca_pig_df, aes(PC3, PC4, colour=virus, shape=virus)) +
+  geom_point(size=4, alpha=0.6) +
+  scale_shape_manual(values=1:length(unique(pca_pig_df$virus))) +
+  theme_minimal(base_size=13) +
+  labs( title="Pig",
+    x=paste0("PC3 (", round(var_explained_pig[3]*100,1),"%)"),
+    y=paste0("PC4 (", round(var_explained_pig[4]*100,1),"%)") ) +
+  ggrepel::geom_text_repel( aes(label=gsub("PK-15_","",sample)),
+    size=4, max.overlaps=999  )
+dev.off()
+
+## == COW PCA =======================
+
+E_cow <- E_norm[, targets$host == "cow"]
+targets_cow <- targets[targets$host == "cow", ]
+keep_cow <- rowSums(is.na(E_cow)) < (0.5 * ncol(E_cow))
+E_cow_pca <- E_cow[keep_cow, ]
+row_means_cow <- rowMeans(E_cow_pca, na.rm=TRUE)
+for(i in 1:nrow(E_cow_pca)){
+  E_cow_pca[i, is.na(E_cow_pca[i,])] <- row_means_cow[i] }
+vars <- apply(E_cow_pca, 1, var, na.rm=TRUE)
+E_cow_pca <- E_cow_pca[vars > 0, ]
+pca_cow <- prcomp(t(E_cow_pca), scale.=TRUE, center=TRUE)
+var_explained_cow <- pca_cow$sdev^2 / sum(pca_cow$sdev^2)
+
+pca_cow_df <- as.data.frame(pca_cow$x)
+pca_cow_df$sample <- rownames(pca_cow_df)
+pca_cow_df <- merge(pca_cow_df, targets_cow, by="sample", sort=FALSE)
+
+pdf("PCA_cow_1_2.pdf", width=8, height=7) 
+c12 <- ggplot(pca_cow_df, aes(PC1, PC2, colour=virus, shape=virus)) +
+  geom_point(size=4, alpha=0.6) +
+  scale_shape_manual(values=1:length(unique(pca_cow_df$virus))) +
+  theme_minimal(base_size=13) +
+  labs(    title="Cow",
+    x=paste0("PC1 (", round(var_explained_cow[1]*100,1),"%)"),
+    y=paste0("PC2 (", round(var_explained_cow[2]*100,1),"%)")) +
+  ggrepel::geom_text_repel(  aes(label=gsub("MDBK_","",sample)),
+    size=4, max.overlaps=999  )
+dev.off()
+
+pdf("PCA_cow_3_4.pdf", width=8, height=7) 
+c34 <- ggplot(pca_cow_df, aes(PC3, PC4, colour=virus, shape=virus)) +
+  geom_point(size=4, alpha=0.6) +
+  scale_shape_manual(values=1:length(unique(pca_cow_df$virus))) +
+  theme_minimal(base_size=13) +
+  labs(    title="Cow",
+    x=paste0("PC3 (", round(var_explained_cow[3]*100,1),"%)"),
+    y=paste0("PC4 (", round(var_explained_cow[4]*100,1),"%)")) +
+  ggrepel::geom_text_repel(  aes(label=gsub("MDBK_","",sample)),
+    size=4, max.overlaps=999)
+dev.off()
+
+library(gridExtra)
+pdf("PCA_all.pdf", width=15, height=15)
+grid.arrange(  h12, h34,
+  p12, p34,  c12, c34,
+  ncol = 2, nrow =3 )
+dev.off()
+
+#  genes
+
+# ===============================
+# HUMAN loadings → gene lists
+# ===============================
+num=100
+loadings_human <- as.data.frame(pca_human$rotation[, 1:2])
+loadings_human$Gene <- rownames(loadings_human)
+top_pc1_human <- loadings_human[
+  order(abs(loadings_human$PC1), decreasing=TRUE), ][1:num, c("Gene","PC1")]
+top_pc2_human <- loadings_human[
+  order(abs(loadings_human$PC2), decreasing=TRUE), ][1:num, c("Gene","PC2")]
+
+loadings_pig <- as.data.frame(pca_pig$rotation[, 1:2])
+loadings_pig$Gene <- rownames(loadings_pig)
+top_pc1_pig <- loadings_pig[
+  order(abs(loadings_pig$PC1), decreasing=TRUE), ][1:num, c("Gene","PC1")]
+top_pc2_pig <- loadings_pig[
+  order(abs(loadings_pig$PC2), decreasing=TRUE), ][1:num, c("Gene","PC2")]
+
+loadings_cow <- as.data.frame(pca_cow$rotation[, 1:2])
+loadings_cow$Gene <- rownames(loadings_cow)
+top_pc1_cow <- loadings_cow[
+  order(abs(loadings_cow$PC1), decreasing=TRUE), ][1:num, c("Gene","PC1")]
+top_pc2_cow <- loadings_cow[
+  order(abs(loadings_cow$PC2), decreasing=TRUE), ][1:num, c("Gene","PC2")]
+
+# intersection
+sort(intersect(top_pc1_human$Gene, top_pc1_pig$Gene)) # 14
+sort(intersect(top_pc1_human$Gene, top_pc1_cow$Gene) )# 3
+sort(intersect(top_pc1_pig$Gene, top_pc1_cow$Gene)  ) # 18
+
+intersect(intersect(top_pc1_human$Gene, top_pc1_pig$Gene), top_pc1_cow$Gene)
+# none shared across all 3 hosts in PC1 top num
+
+
+
+
