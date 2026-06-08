@@ -1,0 +1,159 @@
+---
+title: "pig-human-cow"
+---
+
+## Get pig-human-cow orthologs
+
+```{r}
+library(biomaRt)
+library(dplyr)
+
+# ── Marts ──────────────────────────────────────────────────────────────────────
+ensembl <- useMart("ensembl")
+pig     <- useDataset("sscrofa_gene_ensembl",  mart = ensembl)
+cow     <- useDataset("btaurus_gene_ensembl",  mart = ensembl)
+human   <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+
+# ── Raw ortholog queries ───────────────────────────────────────────────────────
+homolog_attrs <- c(
+  'ensembl_gene_id',
+  'external_gene_name',
+  'hsapiens_homolog_ensembl_gene',
+  'hsapiens_homolog_associated_gene_name',
+  'hsapiens_homolog_orthology_type',
+  'hsapiens_homolog_orthology_confidence'
+)
+
+pig_human_orthologs <- getBM(attributes = homolog_attrs, mart = pig)
+cow_human_orthologs <- getBM(attributes = homolog_attrs, mart = cow)
+
+# ── Entrez ID queries ──────────────────────────────────────────────────────────
+pig_entrez   <- getBM(attributes = c('ensembl_gene_id', 'entrezgene_id'), mart = pig)
+cow_entrez   <- getBM(attributes = c('ensembl_gene_id', 'entrezgene_id'), mart = cow)
+human_entrez <- getBM(attributes = c('ensembl_gene_id', 'entrezgene_id'), mart = human)
+
+# ── Build species-pair tables ──────────────────────────────────────────────────
+pig_human_complete <- pig_human_orthologs %>%
+  left_join(pig_entrez, by = "ensembl_gene_id") %>%
+  rename(pig_entrezgene_id = entrezgene_id)
+
+cow_human_complete <- cow_human_orthologs %>%
+  left_join(cow_entrez, by = "ensembl_gene_id") %>%
+  rename(cow_entrezgene_id = entrezgene_id)
+
+# ── Build three-way table ──────────────────────────────────────────────────────
+# Bridge: pig <-> human (via hsapiens_homolog_ensembl_gene) <-> cow
+cow_pig_human_complete <- pig_human_orthologs %>%
+  # pig Entrez
+  left_join(pig_entrez, by = "ensembl_gene_id") %>%
+  rename(
+    pig_ensembl_gene_id             = ensembl_gene_id,
+    pig_gene_name                   = external_gene_name,
+    pig_entrezgene_id               = entrezgene_id,
+    pig_hsapiens_homolog_orthology_type       = hsapiens_homolog_orthology_type,
+    pig_hsapiens_homolog_orthology_confidence = hsapiens_homolog_orthology_confidence
+  ) %>%
+  # human Entrez (keyed on the human homolog Ensembl ID)
+  left_join(
+    human_entrez %>% rename(
+      hsapiens_homolog_ensembl_gene = ensembl_gene_id,
+      human_entrezgene_id           = entrezgene_id
+    ),
+    by = "hsapiens_homolog_ensembl_gene"
+  ) %>%
+  # cow ortholog info, bridged through shared human Ensembl ID
+  left_join(
+    cow_human_orthologs %>%
+      select(
+        hsapiens_homolog_ensembl_gene,
+        cow_ensembl_gene_id    = ensembl_gene_id,
+        cow_gene_name          = external_gene_name,
+        cow_homolog_type       = hsapiens_homolog_orthology_type,
+        cow_homolog_confidence = hsapiens_homolog_orthology_confidence
+      ),
+    by = "hsapiens_homolog_ensembl_gene"
+  ) %>%
+  # cow Entrez
+  left_join(
+    cow_entrez %>% rename(cow_ensembl_gene_id = ensembl_gene_id,
+      cow_entrezgene_id   = entrezgene_id ), by = "cow_ensembl_gene_id" ) %>%
+  # tidy column order: pig | human bridge | cow
+  select(  pig_ensembl_gene_id,
+    pig_gene_name,
+    pig_entrezgene_id,
+    pig_hsapiens_homolog_orthology_type,
+    pig_hsapiens_homolog_orthology_confidence,
+    hsapiens_homolog_ensembl_gene,
+    hsapiens_homolog_associated_gene_name,
+    human_entrezgene_id,
+    cow_ensembl_gene_id,
+    cow_gene_name,
+    cow_entrezgene_id,
+    cow_homolog_type,
+    cow_homolog_confidence  )
+
+str(cow_pig_human_complete)
+
+# ── Species-pair 1-to-1 filters ────────────────────────────────────────────────
+orthologs_1to1_ph <- pig_human_complete %>%
+  filter(hsapiens_homolog_orthology_type       == "ortholog_one2one",
+         hsapiens_homolog_orthology_confidence == 1)
+
+orthologs_1to1_ch <- cow_human_complete %>%
+  filter(hsapiens_homolog_orthology_type       == "ortholog_one2one",
+         hsapiens_homolog_orthology_confidence == 1)
+
+# ── Three-way 1-to-1 filter ────────────────────────────────────────────────────
+# Requires high-confidence 1-to-1 in BOTH pig->human AND cow->human
+orthologs_1to1_chp <- cow_pig_human_complete %>%
+  filter(
+    pig_hsapiens_homolog_orthology_type       == "ortholog_one2one",
+    pig_hsapiens_homolog_orthology_confidence == 1,
+    cow_homolog_type                          == "ortholog_one2one",
+    cow_homolog_confidence                    == 1,
+    !is.na(cow_ensembl_gene_id)
+  )
+
+str(orthologs_1to1_ph)   # pig-human 16029 obs. of  7 variables:
+str(orthologs_1to1_ch)   # cow-human 14542 obs. of  7 variables:
+str(orthologs_1to1_chp)  # three-way 13747 obs. of  13 variables
+
+# remove pig_hsapiens_homolog_orthology_confidence, cow_homolog_confidence
+orthologs_1to1_chp |> select(-pig_hsapiens_homolog_orthology_confidence,
+                            -cow_homolog_confidence, -cow_homolog_type,
+                  -pig_hsapiens_homolog_orthology_type) -> orthologs_1to1_chp
+
+View(orthologs_1to1_chp)
+
+# ── Save ───────────────────────────────────────────────────────────────────────
+write.csv(orthologs_1to1_ph,  "pig_human_orthologs_1to1.csv",    row.names = FALSE)
+write.csv(orthologs_1to1_ch,  "cow_human_orthologs_1to1.csv",    row.names = FALSE)
+write.csv(orthologs_1to1_chp, "pig_cow_human_orthologs_1to1.csv",row.names = FALSE)
+
+## 
+
+setwd("~/Desktop/Pan_virus_AI_Surrey_2026/")
+
+library(readxl)
+#BiocManager::install("limma")
+library(limma)
+library(ggplot2)
+library(matrixStats)
+library(stringr) 
+library(reshape2)
+
+df <- read_excel("pan_virus_surrey.xlsx")
+dim(df)
+gene_names <- df[[1]]   # first column explicitly
+str(gene_names)
+
+# get names overlap
+# merge orthologs_1to1_chp and df by gene name
+merged_df <- merge(orthologs_1to1_chp, df,
+          by.x = "hsapiens_homolog_associated_gene_name", by.y = "Gene")
+
+dim(merged_df) # 3232 out of 3934
+write.csv(merged_df, "merged_orthologs_panvirus.csv", row.names =F)
+
+```
+
